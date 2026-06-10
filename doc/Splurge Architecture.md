@@ -216,6 +216,14 @@ A **lane** is the sole first-class container in a patch. A lane holds:
 
 The voice configuration is **dormant** when the lane contains no oscillators: such a lane allocates no voices and acts as a pure processing bus, and the voice-config UI simply does not apply. A lane with oscillators allocates voice instances and manages its own polyphony.
 
+A lane's audio originates from one or more of **three source kinds**:
+
+- **Generators** — oscillators, samplers, noise. Note-driven: the lane's voice allocator creates voice instances at note-on, and generators instance into them.
+- **External inputs** — audio from outside the synth (effects-mode hosting, sidechain inputs). Continuous signals with no note lifecycle; voice count of one.
+- **Lane inputs** — audio routed from upstream lanes, arriving at whatever granularity the connecting bus delivers (§5.4).
+
+Channel layout (mono/stereo/multichannel) is a **property of the source** — the audio-input module declares its layout; generators render into the lane's layout. Voice multiplicity is a property of note allocation and unison (§7.5). These are independent axes (§5.4).
+
 There is deliberately **no** "scene," "voice group," "instrument layer," or other second container concept. An earlier design iteration proposed a "voice group" abstraction; it was recognized as collapsing entirely into lanes (separate sets of oscillators in separate lanes, recombining at master) and was removed. Surge's Scene A/B mechanic is likewise not a Splurge concept — it is reconstituted *only* by the importer as two ordinary lanes (§12.3).
 
 ### 5.2 The patch
@@ -235,23 +243,35 @@ A patch is:
 - **Merging** is implicit: multiple lanes targeting the same destination sum there, and the destination's input label reads `<multi>`.
 - **Sends collapse into routing:** there is no separate send/insert mechanism. A "send" is simply a lane that receives routed input (optionally at a routing weight) from one or more other lanes. Surge's send slots import as exactly this (§12.3).
 
-### 5.4 Typed lane signal buses
+### 5.4 Typed lane signal buses: the two-axis model
 
-The connection between lanes is a **typed signal bus**, not a hardcoded stereo pair. The bus carries one of three voice-granularity modes plus an independent channel layout:
+The connection between lanes is a **typed signal bus**, not a hardcoded stereo pair. A bus — and a lane's internal signal — is structured as a small matrix along two **orthogonal axes** with different semantics and different collapse rules. (An earlier design iteration considered unifying voices and channels into a single strand count — "a stereo input is two voices" — and rejected it: the two axes collapse under different rules, and merging them makes boundary behavior ambiguous.)
 
-**Voice granularity** (chosen on the downstream lane — see §7.4):
+**The voice axis** — source-side multiplicity: "how many simultaneous instances of this sound exist?"
 
-- **Disengaged** — the lane processes a single post-mix stream; the upstream lane sums all voices before transmitting. This is the default and matches a conventional FX bus.
-- **Per-note** — each note instance is carried as its own signal. If the user plays a chord, each chord note's signal is processed independently. Valid only between lanes sharing voice scope.
-- **Per-voice** — each voice (in the unison sense) is carried as its own signal. If unison is engaged, each unison detune voice within each note is processed independently. The most expensive mode; also valid only between lanes sharing voice scope.
+- Voices are *ephemeral*: created by note-on, multiplied by unison (§7.5), destroyed at release. External inputs have a voice count of one (no note lifecycle).
+- Voices carry **lineage** — each voice knows its note instance and its unison-group ancestry (note → unison group → clone). Lineage is what makes collapse levels well-defined.
+- The voice axis collapses by **summation**, which is always semantically safe (it is simply mixing). Collapse happens at **mix points** (§7.4) to one of three levels: **single stream** (sum everything), **per-note** (sum each note's clones; keep notes separate), or **per-voice** (keep every clone separate).
 
-**Channel layout** (independent of voice granularity):
+**The channel axis** — destination-side geometry: "where does this signal sit in space?"
 
-- **Stereo** — the default; a stereo pair.
-- **Mono** — a single channel; cheaper where stereo is meaningless.
-- **Multichannel** — surround, ambisonic, or other layouts. The same abstraction generalizes here: once the bus is typed, adding a layout is a matter of defining the type and its connection rules, not re-architecting.
+- Channels are *static*: L is always L; their natural endpoint is the output layout. Layouts: **mono**, **stereo** (default), **multichannel** (surround, ambisonic, or others — adding a layout is a matter of defining the type and its adaptation rules, not re-architecting).
+- Channel layout is a **source-side property** (§5.1). Within a lane's per-voice phase the layout is fixed per lane (default stereo); each voice renders into it (per-voice stereo with per-voice pan, as in Surge).
+- The channel axis adapts by **layout rules** at lane boundaries when producer and consumer layouts differ: mono→stereo duplicates or center-pans; stereo→mono sums with a pan law; multichannel uses defined matrices. These are the standard adaptations every DAW applies at every pin connection — well-trodden, nothing novel.
 
-The initial release may implement only stereo with the disengaged-and-per-note voice modes; the per-voice (unison) granularity and multichannel layouts are designed in from the start so the others are additive features, not refactors.
+The axes never interact: unison multiplies voices and never touches channels; pan and width operate on channels within each voice; mix points sum voices; layout adaptation happens only at boundaries. Worked examples:
+
+| Signal | Voice axis | Channel axis |
+|---|---|---|
+| Stereo external input | 1 | 2 |
+| Mono-rendering oscillator with unison 3 | 3 | 1 |
+| Stereo-rendering oscillator with unison 3 | 3 | 2 |
+| …followed by a Unison module ×3 (§7.5) | 9 | 2 |
+| A held 4-note chord on the above | 36 | 2 |
+
+Boundary resolution is deterministic: voices sum to the granularity the consumer requested; the channel layout adapts by rule. A 3-voice × 2-channel lane feeding a plain stereo bus performs one summation along the voice axis and no channel work at all.
+
+The initial release may implement only stereo with single-stream and per-note collapse; per-voice granularity and multichannel layouts are designed in from the start so they are additive features, not refactors.
 
 ### 5.5 Multiband splitting is a lane primitive
 
@@ -271,8 +291,10 @@ A new patch contains one lane with a conventional subtractive layout (oscillator
 | FX bus / send | An oscillator-free lane receiving weighted input from other lanes |
 | Multiband processing | Splitter lane → three band lanes (each with its own FX) → master |
 | Mono lead over poly pad | Two lanes with different polyphony modes |
-| Per-note FX | Downstream lane set to per-note granularity; processes each chord note's signal independently (§7.4) |
-| Per-unison-voice processing | Downstream lane set to per-voice granularity; each unison voice within each note is processed independently (§7.4) |
+| Per-note FX | Consuming lane's input mix point set to per-note collapse; each chord note's signal is processed independently (§7.4) |
+| Per-unison-voice processing | Mix point set to per-voice collapse; each unison clone of each note is processed independently (§7.4) |
+| Extreme unison stacking | Unison modules in series multiply voice counts (3 × 3 = 9 clones per note) (§7.5) |
+| Dual-mono / mid-side chains | Channel-splitter or M/S utility routes each channel to its own lane; recombine downstream (§10.5) |
 | Feedback resonance | An audio-rate routing edge from a downstream module's output back into a feedback-input port on an earlier module in the same lane (§6.6) |
 
 ---
@@ -291,6 +313,8 @@ A lane without oscillators is pure phase 2 from its first module.
 ### 6.2 The transition is automatic and visible
 
 The phase 1 → phase 2 transition (the "voice mix") occurs **automatically at the first module in the chain that requires post-mix context**. The user does not manage it, but the UI renders it as a visible divider in the lane so the structure is legible. If the user inserts a post-mix-only module early in a chain, the divider simply moves; nothing breaks. Power users may force an earlier transition (e.g., by dragging the divider or inserting an explicit voice-mix point) — a rare need.
+
+The divider is a **mix point** in the sense of §7.4: it carries the collapse-level setting (single stream / per-note / per-voice) governing what survives into phase 2. The default is a full sum to a single stream — the conventional behavior.
 
 ### 6.3 Module context capability
 
@@ -346,21 +370,43 @@ The engine's voice runtime handles: note on/off and voice allocation per lane; v
 
 Surge allocates oscillator state into fixed-size placement buffers. Splurge must **not** carry a fixed per-voice state cap: future modules (notably the granular oscillator, with many grains in flight) have much larger and variable per-voice footprints. Voice state allocation must be dynamic or generously tunable from the first engine design.
 
-### 7.4 Lane voice-granularity modes
+### 7.4 Voice collapse at mix points
 
-Each lane chooses how it consumes upstream signals along the voice axis (§5.4). The control is a three-position setting on the lane (inspired by Phase Plant's "Poly" button, generalized):
+The voice axis (§5.4) is collapsed at **mix points** — not configured on sources, and not configured on lanes as a whole. (Both alternatives were considered and rejected during review; see below.) A mix point is any place where summation can occur:
 
-- **Disengaged (default).** The lane consumes a single post-mix signal — the sum of all voices from upstream. Cheapest; matches a conventional FX bus.
-- **Per-note.** Each note instance is a separate signal in the lane. The lane's modules instance per note. If the user plays a chord, each chord note's signal is processed independently — voice LFOs run per-note, modulation can vary per-note, the filter rings differently per-note.
-- **Per-voice.** Each unison voice within each note is a separate signal. With unison engaged on the upstream lane, each detuned unison voice is processed independently — the highest-fidelity mode and the most CPU-intensive.
+- the **phase divider** inside a voice-bearing lane (§6.2), and
+- the **input of a consuming lane** — each lane-to-lane connection carries its own setting.
 
-Constraints:
+Each mix point selects a collapse level, defined by voice lineage (note → unison group → clone):
 
-- Per-note and per-voice modes are valid only between lanes sharing voice scope (same note triggering, same polyphony pool). The engine validates this at routing time; invalid routings can only be in disengaged mode.
-- All modules in a per-note or per-voice lane must support per-voice context (§6.3).
-- The cost is real: carrying N voices' or unison-voices' buffers between lanes is memory- and CPU-intensive. The user opts in deliberately per-lane.
+- **Single stream (default).** Sum everything; downstream sees one signal. Matches a conventional FX bus.
+- **Per-note.** Sum each note's unison clones; keep notes separate. A held chord is processed as independent per-note signals — modulation can vary per-note, a filter rings differently per-note. (Phase Plant's "Poly" button, generalized.)
+- **Per-voice.** Keep every clone separate; each unison voice of each note is processed independently. The highest-fidelity and most expensive level.
 
-Disengaged is committed for v1. Per-note is the highest-priority extension; per-voice (unison granularity) follows. The typed-bus abstraction that enables both is baked into v1 from the start (§13).
+Design conclusions, settled during review:
+
+- **The setting does not belong to the source.** Two reasons: multiple generators share the lane's voices (a note-voice instances all of them together, so per-generator granularity settings would conflict), and multiple consumers may consume the same lane at *different* granularities — a reverb send takes the summed stream while a per-note filter lane takes the per-note bundle, simultaneously. Sources determine what *exists* to collapse (voice config creates notes; unison creates clones — §7.5); mix points determine what *survives*. Channel layout, by contrast, genuinely is source-side (§5.1).
+- **Module instancing follows the surviving strands.** In a region operating per-note or per-voice, each module runs one instance per strand. Modules with per-voice context support (§6.3) additionally get SIMD voice batching and voice-scoped modulation; other modules run as ordinary independent instances per strand.
+- **Validity.** Per-note or per-voice collapse on a connection requires the producing lane to still carry voice lineage at its output (its own divider hasn't already collapsed below the requested level) and the lanes to share voice scope. The engine validates at routing time; connections that can't satisfy the request run at single-stream.
+- **Cost.** Carrying N strands between lanes multiplies memory and CPU. The user opts in deliberately per mix point, and the UI surfaces the cost.
+
+Single-stream is committed for v1. Per-note is the highest-priority extension; per-voice follows. The typed-bus abstraction enabling all three is baked into v1 (§13).
+
+### 7.5 Unison: an engine facility, not an oscillator secret
+
+Surge implements unison inside its oscillators (per-sub-voice detune/pan/drift arrays summed internally into one output buffer) — efficient, but it makes unison a privilege of oscillators that happen to implement it. Design review concluded that unison is ~90% **voice cloning with seeded variations** (pitch detune, stereo spread, phase offset/randomization, center/side level blend) and only ~10% oscillator-internal niceties (per-sub-voice drift, the sine oscillator's per-sub-voice feedback). Splurge therefore ships both mechanisms:
+
+**The Unison module (Splurge-native).** A **voice-context multiplier**, not an audio processor. Placed in a lane's per-voice phase, it multiplies each incoming voice into N clones, perturbing each clone's voice context: pitch offset (detune amount and spread curve), pan, phase seed, level (center/side blend), optionally start-time jitter.
+
+- **Before the generators** (the classic position): each note becomes N voice contexts; every generator in the lane instances per context with detuned pitch. Works uniformly on every source — wavetable, sampler, granular, and oscillators with no internal unison of their own (e.g., Twist gains unison for free).
+- **Mid-chain:** modules before it run at the incoming granularity; modules after it run per clone, with the upstream signal broadcast into the clones — N context-varied filter instances fed from one source; ensemble effects built from first principles.
+- **Stacked:** Unison modules in series multiply (3 × 3 = 9 clones per note). "Unisons of unisons" fall out for free, because the module is just multiplication on the voice set.
+- Clones extend the voice lineage (note → unison group → clone), which is what keeps per-note vs. per-voice collapse well-defined (§7.4).
+- **Cost:** engine-level unison clones the full per-voice phase (all generators and per-voice modules), so it is more expensive than oscillator-internal unison. This sits within the accepted cost envelope (§8.3), and the SIMD voice batcher benefits — clones fill out 4-wide batches.
+
+**Internal oscillator unison (lifted, kept).** The lifted oscillators retain their built-in unison parameters: the cheap path (clones only the oscillator core, not the voice chain) and the **import target** — Surge patches with per-oscillator unison (e.g., OSC 1 at 7 voices, OSC 2 at 1) map directly onto these parameters with zero translation (§12.3). The UI presents the two coherently — built-in unison as a generator's "classic" unison control; the Unison module as the structural tool — so they don't read as competing features.
+
+**Engine foresight:** voice contexts carry their lineage and per-clone perturbations (pitch offset, pan, phase seed, level) as first-class data readable by the engine and by modules. This same data is required by per-note collapse and key-tracked modulation, so it is part of the v1 voice-runtime design regardless of when the Unison module itself ships (§13).
 
 ---
 
@@ -525,6 +571,8 @@ The general principle (Principle 4) extends across the library — filter primit
 - **Mixer/Mix utility** — mixes N audio inputs with per-input level and pan; used inside oscillator-bearing lanes (replaces Surge's scene mixer) and as a general primitive.
 - **Soft-clip** — soft-clipping primitive available as a module on feedback paths and where users want explicit soft-clipping (used internally by feedback-capable modules; also exposed for direct use).
 - **Noise generator** — multi-color noise (white, pink, brown, blue, violet, gray); replaces Surge's per-scene noise channel and is broadly useful.
+- **Unison** — the voice-context multiplier of §7.5: clones voices with seeded variations (detune, pan, phase, level); stackable; placeable before generators or mid-chain.
+- **Channel splitter / M-S** — splits a stereo signal into per-channel (L/R) or mid/side outputs routed to separate lanes, recombined downstream; the channel-axis sibling of the multiband splitter. Enables dual-mono and mid/side processing chains.
 
 These are independently useful and not import-only artifacts.
 
@@ -626,6 +674,7 @@ For each populated Surge scene (typically two — scene A and scene B), the impo
 | Per-scene key range and MIDI channel filter (derived from `scene_mode`: single / split / dual / chsplit, with `splitpoint`) | Lane key-range and channel-filter parameters |
 | Per-scene portamento + its sub-options (curve: log/lin/exp; constant rate; glissando; retrigger) | Lane portamento parameters; all sub-options preserved as per-parameter flags (§12.7) |
 | Per-scene 3 oscillators | 3 oscillator module instances in the lane, in order |
+| Per-oscillator unison (count, detune, extended/absolute flags) | The lifted oscillator's **internal** unison parameters, unchanged (§7.5); the importer never synthesizes a Unison module |
 | Per-oscillator level / mute / solo | Carried as parameters on the lane's mixer module (§10.5) |
 | Per-oscillator route (Filter 1 / Both / Filter 2) | Wires from each oscillator to either or both filter modules in the lane chain — implemented via the lane's mixer routing, not Surge-style enums |
 | Ring-modulator 1×2 and 2×3 channels (each with level / mute / solo / route) | Two ring-mod modules (§10.5) in the lane, each consuming the appropriate oscillator pair, with routes wired per the route parameter |
@@ -743,9 +792,11 @@ These are agreed *nice-to-haves* — **not** initial-release commitments — eva
 | Spiral LFO; chaotic modulators (Serum 2; Lorenz attractors, etc.) | Modulators emitting separate named outputs (X and Y, etc.) | Multi-output routing sources | **Baked into v1** (§9.1) |
 | Pitch modes: octave/semi/fine; pitch ratios (Serum 2); harmonic ratios (Phase Plant, Serum 2); pitch shift (Phase Plant) | Ratio/harmonic modes follow another oscillator's pitch | Oscillators expose effective pitch as a routing source; the mode UI is a shortcut that creates the edge | **Baked into v1** (§9.3) |
 | **Multiple FM types on each oscillator (Phase Plant)** | PM, linear FM, exponential FM, AM as separate destination ports on every oscillator; users wire modulators to whichever port produces the timbre they want | Module API for multiple distinct modulation destinations per module | **Baked into v1** (§9.5) |
-| Per-note lane processing (Phase Plant "Poly") | Downstream lane processes each note's signal independently | Typed lane buses incl. per-note granularity | **Baked into v1** (§5.4, §7.4) |
-| **Per-unison-voice lane processing** | Downstream lane processes each unison voice within each note independently | Typed lane buses incl. per-voice granularity | **Baked into v1** (§5.4, §7.4) |
-| Multichannel lane output | Surround/ambisonic/other layouts between lanes | Same typed-bus abstraction | **Baked into v1** (§5.4) |
+| Per-note lane processing (Phase Plant "Poly") | A mix point set to per-note collapse; each chord note's signal processed independently downstream | Typed buses with voice-lineage data; per-note collapse at mix points | **Baked into v1** (§5.4, §7.4) |
+| **Per-unison-voice lane processing** | A mix point set to per-voice collapse; each unison clone processed independently | Same, at clone granularity | **Baked into v1** (§5.4, §7.4) |
+| **Unison module (unisons of unisons)** | Voice-context multiplier; stackable (3 × 3 = 9); works on any generator incl. sampler/granular; mid-chain placement for ensemble effects | Voice lineage + per-clone perturbation data in voice contexts; module API for voice multiplication | **Foresight baked into v1** (§7.5); the module itself may land v1 or v1.x |
+| Dual-mono / mid-side processing chains | Channel-splitter and M/S utilities route channels to separate lanes | Channel-axis adaptation rules (§5.4) | Pure addition (§10.5) |
+| Multichannel lane output | Surround/ambisonic/other layouts between lanes | Same typed-bus abstraction (channel axis) | **Baked into v1** (§5.4) |
 | **Routing-edge shaping (custom pitch-bend curves and more)** | Every modulation routing edge carries a shaping function (linear, exponential, S-curve, custom 2D curve, step, inversion); the destination's response is curvable | Routing edges are first-class objects that carry shape parameters | **Baked into v1** (§9.10) |
 | **Feedback as a routable input** | Filters and feedback-capable modules expose feedback-input ports; users route signals back into them to create resonance/feedback topologies | Module API for feedback-input destinations; 1-block delay semantics | **Baked into v1** (§6.6) |
 | Phase offset & randomness (Phase Plant) | Oscillator start-phase control and per-note randomization | None — oscillator parameters | Pure addition |
@@ -874,7 +925,7 @@ Quick reference for planners; each decision is elaborated at the cited section.
 | 11 | Macros and global modulators live at patch level | §5.2, §9.2 |
 | 12 | Cycle prevention via the higher-numbered-lane-or-master rule | §5.3 |
 | 13 | Sends are just lanes; serial/parallel emerges from routing | §5.3 |
-| 14 | Typed lane buses: independent voice-granularity (disengaged/per-note/per-voice) and channel layout (mono/stereo/multichannel) | §5.4, §7.4 |
+| 14 | Typed lane buses: two orthogonal axes — voice (collapse by summation) × channel (adapt by layout rules); merging the axes was considered and rejected | §5.4 |
 | 15 | Multiband splitting is a lane primitive, not an effect | §5.5 |
 | 16 | Default patch is a conventional subtractive lane; routing is opt-in | §5.6 |
 | 17 | Lane phases: per-voice → automatic, visible voice-mix transition → post-mix | §6 |
@@ -907,7 +958,12 @@ Quick reference for planners; each decision is elaborated at the cited section.
 | 44 | Always-on composite color-coded modulation ranges + value cursors; modulation-aware displays; framerate-safe | §14.1–§14.2 |
 | 45 | Knob-first UI | §14.3 |
 | 46 | Accessibility, undo/redo, automation recording designed in from the start | §14.8–§14.9 |
-| 47 | v1 architectural foresight: generic resources, no per-voice state cap, multi-output routing, typed buses (3 voice modes × N channel layouts), FM destination ports, routing-edge shaping, feedback routing | §13 |
+| 47 | v1 architectural foresight: generic resources, no per-voice state cap, multi-output routing, typed buses (3 voice modes × N channel layouts), FM destination ports, routing-edge shaping, feedback routing, voice-lineage data | §13 |
+| 48 | Voice collapse is configured at **mix points** (phase divider, per-connection lane inputs), not on sources or lanes; sources determine what exists, mix points determine what survives | §7.4 |
+| 49 | Channel layout is source-side; lane source taxonomy: generators / external inputs / lane inputs | §5.1 |
+| 50 | Unison module = voice-context multiplier (stackable, mid-chain capable); lifted oscillators keep internal unison as the cheap path and the import target | §7.5 |
+| 51 | Voice lineage (note → unison group → clone) + per-clone perturbations are first-class voice-context data in the v1 voice runtime | §7.5, §13 |
+| 52 | Channel-splitter / M-S utility for dual-mono and mid/side chains | §10.5 |
 
 ---
 
@@ -927,7 +983,7 @@ Orientation points for downstream planners, from the design-phase code review an
 - `libs/simde` (MIT) — SSE→NEON portability. Headers already present; not yet wired across all native intrinsics in Surge.
 
 **Tier B lift surface (un-extracted Surge code Splurge vendors):**
-- Oscillator base & factory: `src/common/dsp/oscillators/OscillatorBase.h`; `spawn_osc` in `Oscillator.cpp`; 12 types in `SurgeStorage.h:283-300`. Audio-rate FM input via `assign_fm` (raw `float*` to the modulator's `output[BLOCK_SIZE_OS]`).
+- Oscillator base & factory: `src/common/dsp/oscillators/OscillatorBase.h`; `spawn_osc` in `Oscillator.cpp`; 12 types in `SurgeStorage.h:283-300`. Audio-rate FM input via `assign_fm` (raw `float*` to the modulator's `output[BLOCK_SIZE_OS]`). Internal unison lives inside the oscillators (`AbstractBlitOscillator` and peers carry per-sub-voice state — detune, drift LFOs, pan, up to `MAX_UNISON` — summed internally to one output buffer); this is the basis for keeping oscillator-internal unison as the cheap path and import target (§7.5).
 - Modulation classes: `src/common/dsp/modulators/` — `ModulationSource`, `LFOModulationSource`, `ADSRModulationSource`, MSEG and Formula evaluators, step sequencer, controller sources.
 - Lipol smoothers: `src/common/dsp/vembertech/lipol.h` (~1000 lines, SIMD parameter smoothing).
 - Wavetable: `src/common/Wavetable.{h,cpp}` — mipmapped, shared across voices.
