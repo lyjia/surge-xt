@@ -49,7 +49,7 @@ These principles were established during design and should govern all downstream
 5. **Visual truth.** Anything that has a visible control reflects its current effective state in that control's visible state — always, not only when a modulator is selected.
 6. **Performance optimizations must not shape user-facing architecture.** SIMD voice batching and threading are engine concerns hidden behind module context metadata (§6, §8); the user never arranges modules *for* the optimizer, though the UI may gently surface why a module fits certain contexts.
 7. **Framework independence of the core.** The module library and engine core are plain C++ with no GUI-framework types in their public interfaces. The framework (JUCE) is confined to the GUI layer and host adapters (§4).
-8. **Import compatibility by construction.** Module identity, parameter schemas, and behavior evolve under strict additive rules (§10.3) so that every Surge XT preset remains importable forever, and Splurge presets remain loadable across Splurge versions.
+8. **Import compatibility by construction.** Module identity, parameter schemas, and behavior evolve under strict additive rules (§10.3) so that every Surge XT preset remains importable forever, and Splurge presets remain loadable across Splurge versions. Preset compatibility is a **one-way hard guarantee**: every preset ever saved loads in every future Splurge; loading newer presets in older versions is explicitly not promised (§11.6).
 9. **Lift discipline.** Lifted code carries forward only what serves Splurge's design. Surge features built outside the spirit of a clean modular architecture (e.g., the Alias oscillator's modes that synthesize from arbitrary patch memory) are dropped during the lift, with import warnings for affected presets (§3.5). Favor simplicity over forced fidelity to Surge quirks.
 10. **Accessibility from the start.** Surge XT has a genuine accessibility story; Splurge designs accessibility in from day one rather than retrofitting (§14.8).
 11. **Programmatic authorability.** The patch format is a structured, machine-readable document (§11.1) — composable by tools, scripts, and language models, not just by the GUI.
@@ -457,7 +457,7 @@ Three options were evaluated for letting oscillators modulate parameters:
 
 1. Downsample oscillator output to control rate — rejected (cannot actually do FM/PM).
 2. Make every parameter an audio-rate buffer — rejected (a massive rewrite of every consumer).
-3. **Hybrid (chosen):** routings whose source is audio-rate and whose destination is on an **allowlist of audio-rate-capable destinations** get a dedicated fast path that hands the audio buffer directly to the consumer; all other routings remain control-rate (evaluated once per block). The initial allowlist: FM depth, phase modulation input, filter cutoff — growable over time.
+3. **Hybrid (chosen):** routings whose source is audio-rate and whose destination is on an **allowlist of audio-rate-capable destinations** get a dedicated fast path that hands the audio buffer directly to the consumer; all other routings remain control-rate (evaluated once per block). The initial allowlist: the four oscillator destination ports (PM, linear FM, exponential FM, AM — §9.5), filter cutoff, and **delay time** (delay lines already interpolate their read heads, so module-side support is cheap; validated by the phase-distortion scenario in Appendix B.2) — growable over time.
 
 ### 9.5 Oscillator-as-modulator: four destination ports
 
@@ -619,6 +619,8 @@ Per Principle 11, the patch format must be straightforward for tools, scripts, a
 
 The patch is a **JSON document** with a defined schema. Binary resources (samples, wavetables, impulses) are **addressed by content hash** within the JSON and stored as a separate sidecar — either alongside the JSON file (`patch.json` + `patch.resources/`) or packaged as a single bundle (a ZIP, opaque to the user but containing both). The bundle layout keeps human-editable patches viable while not embedding multi-megabyte sample data in JSON strings.
 
+**Clarification on "human-readable":** the requirement is that the patch body is *not an opaque binary blob* — it is inspectable, diffable, debuggable text. It does **not** mean the schema must be simple. The JSON may be as deeply structured and as complicated as is reasonable in service of the forward-compatibility contract (§11.6); flexibility and machine-composability take precedence over hand-editing ergonomics.
+
 - **Versioned from day one**, with Splurge's stream revisions starting **above** Surge's range (e.g., at 100, with Surge XT currently at 28): any patch whose revision is below the Splurge floor is routed to the Surge importer; at or above, it is a native Splurge patch.
 - Splurge presets are explicitly **not** backward-compatible with Surge (§1.3).
 - Splurge does not load Surge `.fxp` files into the same code path as native `.splurge` patches; the importer (§12) produces a Splurge in-memory model that is then serialized as Splurge JSON.
@@ -648,6 +650,26 @@ The JSON format is required to support, without privileged tooling:
 - Round-trip transformations (load, edit, save) that preserve everything the loader didn't understand (forward-compatible passthrough of unknown fields where safe).
 
 The engine epic must define the JSON Schema and ship a schema-validation step on load that produces actionable errors.
+
+### 11.6 The compatibility contract and schema-evolution rules
+
+**The contract, stated unambiguously in both directions:**
+
+- **Forward (hard guarantee):** a preset saved by *any* Splurge version loads correctly in *every later* Splurge version, forever. There is no expiry, no "supported window," no exceptions.
+- **Backward (explicitly not promised):** a preset saved by a newer Splurge may not load in an older Splurge. When an older version encounters a newer schema revision, it **refuses cleanly** with a clear message naming the required version — it never crashes and never half-loads silently.
+
+The guarantee is achievable only if the schema is engineered for evolution from day one. The following rules are binding on the schema design (and justify whatever structural complexity they require):
+
+1. **Self-describing, ID-addressed structures.** Modules, modulators, lanes, routings, and resources are typed JSON objects identified by stable string IDs — module *type* IDs per §10.2, plus instance IDs unique within the patch. **Nothing is identified by array position**; inserting, removing, or reordering objects never changes the meaning of anything else.
+2. **Per-object version stamps.** The document carries a schema revision; each module instance additionally carries its module streaming version (§10.4). Loaders run migration chains *per object*, not merely per document — a patch can contain modules saved at different module versions and each migrates independently.
+3. **Additive-only evolution.** New features appear as new keys and new typed objects. Existing keys are never repurposed and never change meaning. Removal is deprecation: loaders understand removed concepts forever, even if only to migrate them into their replacements.
+4. **Explicit defaults everywhere.** Every field has a documented default; absence is always legal and always means the default. A parameter added to a module in version N+1 loads version-N instances at its documented default (§10.3).
+5. **Open extension points.** Every object tolerates unknown keys without error. A reserved extension namespace (e.g., a per-object `extensions` map) exists for experimental data that may later be promoted into the schema proper.
+6. **Unknown-content policy, by case.** (a) Unknown keys in a same-or-older-revision document: preserved and re-serialized on save (round-trip passthrough) where safe — supporting external tools that annotate patches. (b) A higher-revision document: clean refusal per the contract. (c) An unknown module *type* ID: a clean, specific error naming the missing module (§10.2) — distinguishable from schema failure, since it may simply mean a missing optional module pack.
+7. **Migrations are forever.** Once a migration step ships, it is never deleted. The loader migrates any historical revision stepwise to current. The test suite retains golden presets from **every shipped revision** and loads them all on every release (§15).
+8. **No semantic magic numbers.** Enums serialize as strings, not integers (a reordered enum can never corrupt a patch). Units and value semantics are explicit in the schema, never implied by context that could drift between versions.
+
+These rules exist precisely so that features not yet conceived — new module types, new routing concepts, new bus types, new lane semantics, things this document doesn't anticipate — land as *additive* schema (new typed objects, new keys, new extension data) without ever breaking the ability to read what came before.
 
 ---
 
@@ -788,6 +810,7 @@ These are agreed *nice-to-haves* — **not** initial-release commitments — eva
 | Feature (inspiration) | Description | Architectural prerequisite | Status of prerequisite |
 |---|---|---|---|
 | Sampler oscillator (Serum 2, Phase Plant) | Sample playback as an oscillator: pitch resampling, start/end, loop points | Generic embedded binary resources in the patch format | **Baked into v1** (§11.2) |
+| **Resample-to-wavetable** (Serum 2) | Render a lane's output (or a selection of it) into a framed wavetable resource, in-app; enables tricks like tempo-synced reece beating (Appendix B.3) | Offline/headless render path (already implied by the framework-independent engine); frame slicing; generic resource facility (§11.2) | Feature wishlist — architecture-ready; pure addition |
 | Granular oscillator (Phase Plant) | Grain scheduling/density/position over sample data | No fixed per-voice state cap | **Baked into v1** (§7.3) |
 | Spiral LFO; chaotic modulators (Serum 2; Lorenz attractors, etc.) | Modulators emitting separate named outputs (X and Y, etc.) | Multi-output routing sources | **Baked into v1** (§9.1) |
 | Pitch modes: octave/semi/fine; pitch ratios (Serum 2); harmonic ratios (Phase Plant, Serum 2); pitch shift (Phase Plant) | Ratio/harmonic modes follow another oscillator's pitch | Oscillators expose effective pitch as a routing source; the mode UI is a shortcut that creates the edge | **Baked into v1** (§9.3) |
@@ -803,6 +826,9 @@ These are agreed *nice-to-haves* — **not** initial-release commitments — eva
 | Noise oscillator | Standard and exotic generated noise colors; sampled noise expected via the sampler instead | None — new module (§10.5) | Pure addition |
 | LFO behaviors | Free-run w/ BPM sync or key-trigger; normal/ping-pong/reverse/no-loop (envelope); free phase | None — module-level (§9.7); cheap enough that these may land in v1 | Pure addition |
 | Cross-lane oscillator modulation | Upstream lane's summed audio as a "global" modulation source | Audio-rate hybrid path (§9.4) plus a labeled global-source concept | Post-v1 (§9.5) |
+| **Audio-input modulators** (envelope follower; possibly pitch detector) | Modulators that *consume* audio and emit control signals — enables sidechain pumping, auto-wah, audio-reactive modulation (Appendix B.4) | Modulators may declare audio-input ports; routing system already supports audio-rate edges | Pure addition — port concept worth reserving in the v1 modulator API |
+| Cross-module hard sync | Oscillator A's phase reset by oscillator B's cycle boundary | Event-typed signal routing (§17 #18); lifted oscillators' internal sync params cover the classic case meanwhile | Post-v1; open question |
+| Stutter / buffer-repeat effect | Tempo-synced buffer capture and replay | None — new module | Pure addition |
 | Open-source MTS-ESP-alternative microtonality client | Real-time host-protocol microtonality (the role MTS-ESP plays in Surge) via an open-source library | Tuning system already pluggable via `tuning-library`; protocol client adds a layer | Post-v1, evaluated (§17) |
 
 ---
@@ -860,6 +886,8 @@ Undo/redo across parameter, routing, and structural (lane/module) edits, and hos
 - **Engine tests:** lane-graph construction/ordering, phase-boundary placement, modulation application, voice lifecycle (allocation, stealing, legato/glide), typed-bus connection rules.
 - **Performance:** regression benchmarks against Surge XT on comparable patches (voices/CPU); GUI frame-time budget tests with heavy modulation visualization; thread-scheduler correctness (when enabled) under sanitizers.
 - **Host matrix:** the major DAWs across Windows/macOS/Linux, exercising automation, render/freeze, sample-rate changes, MPE.
+- **Sound-design validation patches:** the Appendix B trick catalogue is maintained as actual patches in the test corpus; each release must keep every recipe working.
+- **Schema-revision corpus:** golden presets from every shipped schema revision, all loaded on every release (the §11.6 forward-compatibility guarantee, enforced mechanically).
 
 ---
 
@@ -900,9 +928,11 @@ Decisions deliberately left open, with context:
 11. **Open-source microtonality client** — pick a real-time host-protocol approach to replace MTS-ESP (or accept file-tuning-only for v1 and revisit). Candidates: a future open MTS-ESP-compatible client, a Splurge-native protocol, or do nothing (§4.5).
 12. **Globals-as-defaults policy details** — exact list of which Splurge per-unit parameters get the inheritance mechanism (§9.11) vs. plain per-unit-only.
 13. **Patch bundle vs. sidecar** — single ZIP bundle (`.splurgepatch`) vs. JSON-plus-folder sidecar layout for resources (§11.2). Bundle is friendlier for sharing; sidecar is friendlier for tool/script editing.
-14. **JSON Schema scope** — how strict to be on load (reject vs. warn vs. silently passthrough unknown fields) given the goal of programmatic authorship (§11.5).
+14. **Schema-leniency detail** — §11.6 fixes the contract (same-revision unknown keys pass through; higher-revision documents refuse cleanly). Remaining question: whether an older Splurge should offer a best-effort partial load of a slightly-newer preset behind explicit user confirmation, or always refuse.
 15. **`fc_dual2` import shape** — the precise sub-lane topology; verify against test patches.
 16. **Per-FX bypass mode in import** — Surge's per-scene FX bypass settings (all / no-sends / no-send+global / no-FX). Map to patch-level or per-lane equivalent (§12.3).
+17. **Routing-edge depth as a modulation destination** — should every edge's depth itself be modulatable (fully general meta-modulation, but it explodes the destination space), or is modulating the source modulator's output-level parameter sufficient (simpler; covers the common "vibrato that develops over time" case — Appendix B.5)?
+18. **Event-typed signals (sync/retrigger routing)** — oscillators emit gate/retrigger (§9.3), but cross-module *hard-sync* needs an event-typed destination port (phase-reset) distinct from audio and control signals (Appendix B.6). Decide whether v1's bus/routing model reserves an event signal type or whether sync stays oscillator-internal initially.
 
 ---
 
@@ -937,7 +967,7 @@ Quick reference for planners; each decision is elaborated at the cited section.
 | 23 | Dynamic string IDs; multi-output sources as (source, output) tuples; no fixed modulator counts | §9.1 |
 | 24 | Modulator scopes: voice / lane / patch; macros modulatable | §9.2 |
 | 25 | Modules expose internal signals (pitch, gate, audio out…) as routing sources | §9.3 |
-| 26 | Audio-rate modulation via hybrid allowlist (PM, lin-FM, exp-FM, AM, filter cutoff to start) | §9.4 |
+| 26 | Audio-rate modulation via hybrid allowlist (PM, lin-FM, exp-FM, AM, filter cutoff, delay time to start) | §9.4 |
 | 27 | **Oscillators expose four distinct destination ports: PM, linear FM, exponential FM, AM (Phase Plant-style)** | §9.5 |
 | 28 | No FM-topology enum; Surge fm_routing maps to routing edges into PM ports | §9.6, §12.5 |
 | 29 | LFO commitments: trigger modes, BPM sync, loop modes (normal/ping-pong/reverse/one-shot), free phase | §9.7 |
@@ -964,6 +994,11 @@ Quick reference for planners; each decision is elaborated at the cited section.
 | 50 | Unison module = voice-context multiplier (stackable, mid-chain capable); lifted oscillators keep internal unison as the cheap path and the import target | §7.5 |
 | 51 | Voice lineage (note → unison group → clone) + per-clone perturbations are first-class voice-context data in the v1 voice runtime | §7.5, §13 |
 | 52 | Channel-splitter / M-S utility for dual-mono and mid/side chains | §10.5 |
+| 53 | Preset compatibility contract: forward-loading guaranteed forever; backward explicitly not promised; clean refusal on newer revisions | §11.6 |
+| 54 | Schema-evolution rules: ID-addressed self-describing objects, per-object version stamps, additive-only, explicit defaults, extension points, string enums, eternal migrations + golden-preset corpus | §11.6 |
+| 55 | "Human-readable" clarified: not-a-binary-blob; schema complexity is acceptable in service of flexibility | §11.1 |
+| 56 | Sound-design trick catalogue as living design-validation suite; processing-order law (forward edges same-block, backward edges 1-block) | Appendix B |
+| 57 | Resample-to-wavetable, audio-input modulators (envelope follower), cross-module sync, and stutter module on the feature wishlist | §13 |
 
 ---
 
@@ -1034,3 +1069,92 @@ Orientation points for downstream planners, from the design-phase code review an
 - Controls: `ModulatableSlider` — knob vs. slider is orientation in skin XML, not a widget type; modulation display state is three-valued (unmodulated / modulated-by-active / modulated-by-other) with positive/negative colors only — no composite or per-source rendering.
 - Oscillator preview (`OscillatorWaveformDisplay`) renders an unmodulated oscillator instance.
 - Skin engine: XML-driven `.surge-skin` packages under `resources/data/skins/`.
+
+---
+
+## Appendix B: Sound-Design Trick Catalogue (Design Validation)
+
+A living catalogue of nontrivial sound-design techniques — gathered from the field (Serum 2, Phase Plant, producer tutorials) — mapped onto Splurge's primitives. Each entry either validates that the architecture *composes* (the trick is a recipe built from committed primitives) or honestly names the gap it exposes. Planners treat these as candidate regression patches (§15); new tricks get added here and checked the same way. The bar throughout: **tricks should be compositions, not special-case features.**
+
+**A general law worth stating once:** within a lane, modules process in chain order. An audio-rate routing edge pointing *forward* (an earlier module's output into a later module's port — e.g., OSC 2 into OSC 1's PM port, where the modulator is processed first) is **same-block and sample-accurate**. An edge pointing *backward* (a later module's output into an earlier module's port) is a **feedback edge** (§6.6) and carries a one-block delay by construction. Several entries below turn on this distinction.
+
+### B.1 Amplitude-gating one source by another's waveform ✅
+
+*Goal:* a noise generator audible only near the positive peaks of a sub oscillator's sine.
+*Recipe:* sub audio out (§9.3) → noise generator's **AM port** (§9.5), with a steep custom-curve shape on the edge (§9.10) so gain opens only above ~0.8 of the sine's swing.
+*Validates:* shaping living on the edge rather than the modulator; AM as a destination port.
+
+### B.2 Pseudo-phase-distortion via inverted stereo delay-time modulation (Au5 / Serum-style) ✅
+
+*Goal:* modulate a short stereo delay's L/R times with noise, with R receiving the inverted modulation.
+*Recipe:* noise output → delay **L-time** edge (+); the same source → delay **R-time** edge with inversion shaping (§9.10). The lifted delay has independent L/R time parameters; delay time is on the audio-rate allowlist (§9.4).
+*Validates:* one source feeding many edges with per-edge polarity; per-channel parameters; allowlist growability.
+
+### B.3 Tempo-synced reece beating (Serum 2 resampling trick) ◐
+
+*Goal:* convert free-running detune beating into tempo-locked beating — resample two phase-opposed saws into a wavetable, then sweep WT position with a tempo-synced LFO.
+*Playback half:* WT position ← tempo-synced LFO — trivial (§9.7).
+*Capture half:* requires **resample-to-wavetable** — on the feature wishlist (§13); architecture-ready (headless render + §11.2 resources).
+*Native alternatives available without it:* (a) two identical saws, one polarity-inverted at the mixer, with one oscillator's **phase offset** swept by a tempo-synced LFO — the phase sweep *is* the beating, tempo-locked at the source; (b) generate the frames procedurally with the lifted Lua wavetable scripting.
+*Validates:* phase offset as a modulatable parameter; mixer polarity; exposed the resampling gap.
+
+### B.4 Sidechain pumping / auto-wah from audio ◐
+
+*Goal:* duck lane B's volume (or sweep a filter) following the amplitude envelope of lane A's audio (kick-pump, auto-wah).
+*Gap:* requires an **envelope follower** — a modulator that *consumes* audio and emits a control signal. Surge has no standalone envelope-follower modulator (followers exist only inside certain effects). The routing system already supports audio-rate edges, so the addition is: modulators may declare **audio-input ports** (§13). Once it exists: lane A output → follower input; follower output → lane B gain with inversion shaping.
+*Workaround today:* a tempo-synced MSEG shaped like the kick's envelope (the classic "ghost sidechain"), which needs no audio input at all.
+*Exposes:* the audio-input-modulator port concept — reserved in the v1 modulator API, module ships later.
+
+### B.5 Vibrato that develops over time ✅ (with a design note)
+
+*Goal:* LFO → pitch, but the LFO's *influence* grows as a note sustains.
+*Recipe:* the LFO's **output-level parameter** is itself a modulatable module parameter — route an envelope to it. No new machinery.
+*Design note:* the fully general form ("modulate any edge's depth") is an open question (§17 #17). The output-level route covers the common cases without exploding the destination space.
+
+### B.6 Hard sync (classic sync lead) ◐
+
+*Goal:* oscillator A's phase resets every time oscillator B completes a cycle; sweeping B's pitch gives the classic ripping sync sound.
+*Supported today:* the lifted Classic/Modern oscillators carry **internal sync** parameters — the classic case works per-oscillator, as in Surge.
+*Gap:* arbitrary *cross-module* sync (any oscillator hard-synced to any other) needs an **event-typed signal** — a phase-reset destination port, distinct from audio and control signals. Oscillators already emit gate/retrigger as sources (§9.3); the missing half is the typed destination and the routing rule (§17 #18).
+*Exposes:* whether v1's bus model reserves an event signal type.
+
+### B.7 Self-FM / operator feedback ✅ (with the block-delay law)
+
+*Goal:* an oscillator modulating its own phase (the FM-operator feedback sound).
+*Supported today:* the lifted Sine oscillator has **per-sample internal feedback** as a parameter — the canonical case, fully supported.
+*The law applies:* wiring an oscillator's output back into its own PM port via the general routing system is a *backward* edge → one-block delay → audibly different (and mushier) than per-sample feedback. Per-sample self-feedback stays a module-internal feature; the general routing system does not pretend to provide it.
+
+### B.8 Live granular mangling of external input ✅
+
+*Goal:* granular texture from a live input (effects-mode hosting).
+*Recipe:* external input lane (§5.1) → **Nimbus** (lifted; it is literally Mutable Clouds) in the lane's chain. Live granular as an effect, today. The future granular *oscillator* (§13) covers the sample-resource case; Nimbus covers the live case.
+
+### B.9 Karplus-Strong plucks from first principles ✅ / ◐
+
+*Supported today:* the lifted **String oscillator** *is* Karplus-Strong (noise burst into tuned feedback delay lines) — the sound is one module away.
+*The general construction* (build it yourself: noise generator → short delay with feedback edge (§6.6) → keytrack-scaled delay time for tuning) additionally needs a **per-voice-context delay module** — nothing in the architecture forbids one (context capability, §6.3), but the lifted delay is post-mix. An additive module, listed for the library backlog.
+*Validates:* feedback edges + keytrack-shaped routing; exposes the per-voice delay gap.
+
+### B.10 Audio-rate panning (rotary sidebands) ◐
+
+*Goal:* pan position modulated at audio rate — beyond ~20 Hz, panning becomes timbre (sidebands), a classic spatial-distortion trick.
+*Today:* control-rate autopan (LFO → pan) is trivial. Audio-rate pan requires adding **pan** to the §9.4 allowlist plus module-side per-sample pan support — exactly the growth path the allowlist was designed for; no architectural change.
+
+### B.11 Mutual per-sample cross-modulation between modules ❌ (by design)
+
+*Goal:* filter A's output modulates filter B's cutoff *while* B's output modulates A's cutoff, per-sample (zero-delay-feedback modulation networks).
+*Verdict:* **not supported, deliberately.** One direction of any modulation loop is necessarily a backward edge → one-block delay (§6.6). True ZDF modulation *networks* across arbitrary modules require solving implicit equations per sample across the graph — full Reaktor Core territory, explicitly outside Splurge's semi-modular boundary (§1.3). Module-*internal* ZDF (inside a single filter) is unaffected.
+
+### B.12 Pitch-tracking external audio ❌ (for now)
+
+*Goal:* detect the pitch of an external input and drive oscillators with it (audio-to-synth).
+*Verdict:* not in the current design. Would be a **pitch-detector** audio-input modulator (same port concept as B.4) plus genuinely hard, latency-prone DSP. Honest wishlist material; nothing in the architecture blocks it, but nothing supports it yet either.
+
+### B.13 Stutter / buffer-repeat ◐
+
+*Goal:* tempo-synced capture-and-repeat glitching.
+*Verdict:* no current module does this; it is a straightforward **additive module** (a buffer-capture effect with tempo-synced retrigger), no architectural change. Listed in §13.
+
+### B.14 How to use this appendix
+
+When a new trick is proposed: decompose it into routing edges, ports, shaping functions, bus/collapse operations, and modules. If it decomposes — add the recipe here and a patch to the test corpus. If it doesn't — name the missing primitive precisely and take it to §13 (feature) or §17 (design question). Entries marked ✅ are pure compositions; ◐ entries work partially or with a named addition; ❌ entries are out of scope with reasons stated.
