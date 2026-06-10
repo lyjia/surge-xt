@@ -324,6 +324,8 @@ Every module type declares which contexts it supports: **per-voice**, **post-mix
 - Each entry carries an indicator of where it can live (per-voice / post-mix / both).
 - Friendly, intuitive terminology for *why* a module fits certain contexts is a UI-design task, deferred (§17).
 
+> **Validation note (Appendix B):** context capability is also the extension axis for the module library — B.9 identifies a **per-voice-context delay** (for do-it-yourself Karplus-Strong combs) as a gap the architecture already accommodates: it is just a delay module declaring per-voice support, no engine change required.
+
 ### 6.4 Cross-phase modulation constraint
 
 Per-voice modulators cannot modulate phase 2 parameters *per voice* — after the voice mix there is no voice scope. They may contribute only as an aggregated (summed) control signal. The UI must surface this clearly when a routing edge crosses the phase boundary.
@@ -353,6 +355,8 @@ Surge's filter-block feedback (the soft-clipped path that loops the filter chain
 - The "no cycles" rule on lane-to-lane routing (§5.3) is preserved; intra-lane feedback is a per-module facility that does not violate it, because the 1-block delay makes the edge well-defined.
 
 This makes Splurge's resonance and feedback architecture more general than Surge's: any feedback-capable module can be wired into any feedback path, not just the fixed scene-feedback loop.
+
+> **Validation notes (Appendix B):** the one-block-delay rule is load-bearing in three catalogue entries — B.7 (per-sample operator feedback must stay oscillator-internal; routed self-feedback is audibly different), B.9 (Karplus-Strong from primitives works *because* the feedback edge plus keytracked delay time compose), and B.11 (mutual per-sample cross-modulation networks are excluded — one direction of any loop is always a backward edge, and that is the semi-modular boundary working as intended).
 
 ---
 
@@ -474,6 +478,8 @@ These are individual routing destinations on the oscillator module. The UI may s
 
 **Cross-lane (post-v1):** lanes don't share voices, so the only coherent semantic is the upstream lane's *summed* output feeding a downstream port as a single shared (non-per-voice) signal — closer to sidechain modulation. Deferred, and labeled distinctly ("global") in the UI when built.
 
+> **Validation note (Appendix B):** the AM port earns its place in B.1 — gating a noise generator open only near another oscillator's waveform peaks is a three-primitive recipe (exposed audio signal → shaped edge → AM port) rather than a feature. The ports also define where Surge's phase-modulation-labeled-FM lands on import (B.3, §12.5).
+
 ### 9.6 No FM-topology enum
 
 Splurge has no FM topology selector. Surge's four `fm_routing` configurations are entirely an importer concern; they expand into edges connecting oscillators' audio outputs to their PM destination ports (§12.5).
@@ -485,6 +491,9 @@ Lifted: the Surge LFO (full shape set), MSEG, Formula (Lua), DAHDSR-style envelo
 - **Trigger modes:** free-running (tempo-synced to host BPM when sync is enabled) or key-triggered.
 - **Loop modes:** normal, ping-pong, reverse, and no-loop (one-shot/envelope mode).
 - **Freely controllable phase** (start phase/offset as a parameter).
+- **Modulatable output level:** each modulator's output level is itself an ordinary modulatable parameter — this is the committed mechanism for "modulation of modulation depth" cases such as vibrato that develops over time (Appendix B.5), pending the broader edge-depth question (§17 #17).
+
+A planned extension to the catalogue (not lifted from Surge): **audio-input modulators** — modulators that *consume* audio and emit control signals, beginning with an envelope follower. The modulator API reserves audio-input ports from v1 so this lands as an additive module (§13; motivating cases in Appendix B.4 and B.12).
 
 ### 9.8 Extending the modulator roster
 
@@ -506,6 +515,8 @@ Every modulation routing edge — not just specific source types — carries an 
 This covers the "custom pitch-bend response curve" goal — the pitch-bend wheel is a routing source, the destination is any pitch-modulatable parameter, and the response curve is the routing's shaping function. Users wanting non-linear pitch bend simply pick a non-linear shape on that routing edge. It also generalizes to any modulator behavior that would otherwise require a special-case "response" parameter (velocity curves, aftertouch curves, key-tracking curves, etc.) — they all become the routing edge's shaping function.
 
 Audio-rate routings (§9.4) support shaping where the engine can apply it sample-accurately; control-rate routings always do.
+
+> **Validation notes (Appendix B):** edge shaping is the decisive ingredient in B.1 (a steep threshold curve turns continuous AM into peak-gating) and B.2 (the inversion shape gives the stereo delay its anti-phase L/R modulation from a single noise source). Both tricks would otherwise require special-case features; with shaping on the edge they are recipes.
 
 ### 9.11 Globals-as-defaults policy (per Principle 2)
 
@@ -628,6 +639,8 @@ The patch is a **JSON document** with a defined schema. Binary resources (sample
 ### 11.2 Resources
 
 Resources are a **generic, typed-blob** facility addressed by content hash (e.g., SHA-256), not wavetable-specific. The JSON references resources by hash; the loader resolves hashes against the patch's sidecar/bundle, then against a user-configured library. Required so samples (sampler oscillator), wavetables, impulses (convolution), and any future binary resource type embed uniformly. By-name references to library resources are also supported (and preferred where possible — content-hash resolution preserves a name-resolution fallback for portability).
+
+> **Validation note (Appendix B):** the resource facility is also the landing zone for the **resample-to-wavetable** wishlist feature (B.3) — a captured wavetable is just another content-hashed resource the engine writes instead of reads, which is why that feature is architecture-ready despite not being scheduled.
 
 ### 11.3 Metadata, categories, and tags
 
